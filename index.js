@@ -190,13 +190,44 @@ app.get("/items", (req, res) => {
 
 app.post("/items", (req, res) => {
   try {
-    const { item_name, price, is_active } = req.body;
+    console.log("[POST /items] req.body:", req.body);
 
-    if (!item_name) {
-      return res.status(400).json({ error: "Item name required" });
+    const {
+      item_name,
+      price,
+      is_active,
+    } = req.body || {};
+
+    // ── Validation ────────────────────────────────────────────────────────
+    if (!item_name || !String(item_name).trim()) {
+      return res.status(400).json({ error: "item_name is required" });
     }
 
-    // Auto-generate next id: IT00001, IT00002, …
+    const parsedPrice = Number(price);
+    if (price === undefined || price === null || price === "" || !Number.isFinite(parsedPrice) || parsedPrice < 0) {
+      return res.status(400).json({
+        error: `Invalid price: must be a non-negative number (received: ${price})`
+      });
+    }
+
+    // Normalise is_active → 'Y' or 'N'
+    let activeFlag;
+    if (is_active === undefined || is_active === null || is_active === "") {
+      activeFlag = "Y"; // default
+    } else if (typeof is_active === "boolean") {
+      activeFlag = is_active ? "Y" : "N";
+    } else {
+      const u = String(is_active).trim().toUpperCase();
+      if (["Y", "YES", "TRUE", "1", "ACTIVE"].includes(u)) activeFlag = "Y";
+      else if (["N", "NO", "FALSE", "0", "INACTIVE"].includes(u)) activeFlag = "N";
+      else {
+        return res.status(400).json({
+          error: `is_active must be 'Y' or 'N' (received: ${is_active})`
+        });
+      }
+    }
+
+    // ── Auto-generate next item_id: IT00001, IT00002, … ──────────────────
     const maxRes = query(`
       SELECT COALESCE(MAX(CAST(SUBSTR(item_id, 3) AS INTEGER)), 0) AS n
       FROM items
@@ -206,14 +237,15 @@ app.post("/items", (req, res) => {
 
     query(
       `INSERT INTO items (item_id, item_name, price, is_active) VALUES (?, ?, ?, ?)`,
-      [nextId, item_name, price || 0, is_active || "Y"]
+      [nextId, String(item_name).trim(), parsedPrice, activeFlag]
     );
 
     const inserted = query("SELECT * FROM items WHERE item_id = ?", [nextId]);
+    console.log("[POST /items] Created:", inserted.rows[0]);
     res.status(201).json(inserted.rows[0]);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Error creating item" });
+    console.error("[POST /items] Error:", err);
+    res.status(500).json({ error: err.message || "Error creating item" });
   }
 });
 
