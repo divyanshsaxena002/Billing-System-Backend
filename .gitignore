@@ -1,0 +1,8 @@
+# database file — do NOT commit to git
+database.db
+
+# dependencies
+node_modules/
+
+# environment
+.env

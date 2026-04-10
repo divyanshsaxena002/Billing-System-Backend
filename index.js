@@ -1,7 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const db = require("./db");
+const { open, query, connect } = require("./db");
+const initDb = require("./init_db");
 
 const app = express();
 app.use(cors());
@@ -9,20 +10,22 @@ app.use(bodyParser.json());
 
 const GST_RATE = 0.18;
 
-/** Advisory lock key for sequential invoice_id generation (must be unique in this app). */
-const INVOICE_ID_LOCK_KEY = 928_441_001;
+/**
+ * Simple in-process mutex so concurrent POST /invoice/create requests
+ * cannot race and reuse the same invoice number.
+ * (sql.js is single-threaded, but async routes can interleave.)
+ */
+let invoiceLock = Promise.resolve();
 
 /**
  * Next human-readable invoice id: INVC + 6 digits (INVC000001 … INVC999999).
- * Uses pg_advisory_xact_lock so concurrent creates cannot reuse the same number.
  */
-async function generateUniqueInvoiceId(client) {
-  await client.query("SELECT pg_advisory_xact_lock($1)", [INVOICE_ID_LOCK_KEY]);
-
-  const maxRes = await client.query(`
-    SELECT COALESCE(MAX((SUBSTRING(invoice_id FROM 5))::INTEGER), 0) AS n
+function generateUniqueInvoiceId(client) {
+  // GLOB pattern for INVC followed by exactly 6 digits
+  const maxRes = client.query(`
+    SELECT COALESCE(MAX(CAST(SUBSTR(invoice_id, 5) AS INTEGER)), 0) AS n
     FROM invoices
-    WHERE invoice_id ~ '^INVC[0-9]{6}$'
+    WHERE invoice_id GLOB 'INVC[0-9][0-9][0-9][0-9][0-9][0-9]'
   `);
 
   let nextNum = Number(maxRes.rows[0].n) + 1;
@@ -32,16 +35,11 @@ async function generateUniqueInvoiceId(client) {
 
   let candidate = `INVC${String(nextNum).padStart(6, "0")}`;
 
-  // Safety: if pattern data is messy, retry with incremented numbers until free or cap
   for (let attempts = 0; attempts < 50; attempts++) {
-    const dup = await client.query("SELECT 1 FROM invoices WHERE invoice_id = $1", [candidate]);
-    if (dup.rowCount === 0) {
-      return candidate;
-    }
+    const dup = client.query("SELECT 1 FROM invoices WHERE invoice_id = ?", [candidate]);
+    if (dup.rowCount === 0) return candidate;
     nextNum += 1;
-    if (nextNum > 999_999) {
-      throw new Error("Invoice number pool exhausted");
-    }
+    if (nextNum > 999_999) throw new Error("Invoice number pool exhausted");
     candidate = `INVC${String(nextNum).padStart(6, "0")}`;
   }
 
@@ -49,57 +47,35 @@ async function generateUniqueInvoiceId(client) {
 }
 
 /**
- * GST: if customer has GST number AND is_active = 'Y' → no GST.
- * Otherwise → apply 18%.
- * Returns subtotal, gst line amount, final total, and gst_applied flag.
+ * GST: if customer has a GST number AND is_active = 'Y' → no GST (exempt).
+ * Otherwise → apply 18 %.
  */
 function computeInvoiceTotals(subtotal, customerRow) {
   if (!customerRow) {
     const gstAmount = subtotal * GST_RATE;
-    return {
-      subtotal,
-      gstAmount,
-      totalAmount: subtotal + gstAmount,
-      gstApplied: true,
-    };
+    return { subtotal, gstAmount, totalAmount: subtotal + gstAmount, gstApplied: true };
   }
   const hasGst = String(customerRow.cust_gst ?? "").trim() !== "";
   const activeY = String(customerRow.is_active ?? "").trim().toUpperCase() === "Y";
   const gstExempt = hasGst && activeY;
   if (gstExempt) {
-    return {
-      subtotal,
-      gstAmount: 0,
-      totalAmount: subtotal,
-      gstApplied: false,
-    };
+    return { subtotal, gstAmount: 0, totalAmount: subtotal, gstApplied: false };
   }
   const gstAmount = subtotal * GST_RATE;
-  return {
-    subtotal,
-    gstAmount,
-    totalAmount: subtotal + gstAmount,
-    gstApplied: true,
-  };
+  return { subtotal, gstAmount, totalAmount: subtotal + gstAmount, gstApplied: true };
 }
 
-async function ensureInvoiceGstColumn() {
-  await db.query(`
-    ALTER TABLE invoices
-    ADD COLUMN IF NOT EXISTS gst_applied BOOLEAN NOT NULL DEFAULT false
-  `);
-}
+// ─── Health check ────────────────────────────────────────────────────────────
 
-// Test route
 app.get("/", (req, res) => {
   res.send("Server running 🚀");
 });
 
 // ===================== CUSTOMERS =====================
 
-app.get("/customers", async (req, res) => {
+app.get("/customers", (req, res) => {
   try {
-    const result = await db.query("SELECT * FROM customers ORDER BY cust_id");
+    const result = query("SELECT * FROM customers ORDER BY cust_id");
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -107,7 +83,7 @@ app.get("/customers", async (req, res) => {
   }
 });
 
-app.post("/customers", async (req, res) => {
+app.post("/customers", (req, res) => {
   try {
     const { cust_name, cust_address, cust_pan, cust_gst, is_active } = req.body;
 
@@ -115,15 +91,22 @@ app.post("/customers", async (req, res) => {
       return res.status(400).json({ error: "Customer name required" });
     }
 
-    const result = await db.query(
-      `INSERT INTO customers
-      (cust_name, cust_address, cust_pan, cust_gst, is_active)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING *`,
-      [cust_name, cust_address || "", cust_pan || "", cust_gst || "", is_active || "Y"]
+    // Auto-generate next id: C00001, C00002, …
+    const maxRes = query(`
+      SELECT COALESCE(MAX(CAST(SUBSTR(cust_id, 2) AS INTEGER)), 0) AS n
+      FROM customers
+      WHERE cust_id GLOB 'C[0-9][0-9][0-9][0-9][0-9]'
+    `);
+    const nextId = `C${String(Number(maxRes.rows[0].n) + 1).padStart(5, "0")}`;
+
+    query(
+      `INSERT INTO customers (cust_id, cust_name, cust_address, cust_pan, cust_gst, is_active)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [nextId, cust_name, cust_address || "", cust_pan || "", cust_gst || "", is_active || "Y"]
     );
 
-    res.status(201).json(result.rows[0]);
+    const inserted = query("SELECT * FROM customers WHERE cust_id = ?", [nextId]);
+    res.status(201).json(inserted.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error creating customer" });
@@ -132,9 +115,9 @@ app.post("/customers", async (req, res) => {
 
 // ===================== ITEMS =====================
 
-app.get("/items", async (req, res) => {
+app.get("/items", (req, res) => {
   try {
-    const result = await db.query("SELECT * FROM items ORDER BY item_id");
+    const result = query("SELECT * FROM items ORDER BY item_id");
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -142,7 +125,7 @@ app.get("/items", async (req, res) => {
   }
 });
 
-app.post("/items", async (req, res) => {
+app.post("/items", (req, res) => {
   try {
     const { item_name, price, is_active } = req.body;
 
@@ -150,14 +133,21 @@ app.post("/items", async (req, res) => {
       return res.status(400).json({ error: "Item name required" });
     }
 
-    const result = await db.query(
-      `INSERT INTO items (item_name, price, is_active)
-       VALUES ($1, $2, $3)
-       RETURNING *`,
-      [item_name, price || 0, is_active || "Y"]
+    // Auto-generate next id: IT00001, IT00002, …
+    const maxRes = query(`
+      SELECT COALESCE(MAX(CAST(SUBSTR(item_id, 3) AS INTEGER)), 0) AS n
+      FROM items
+      WHERE item_id GLOB 'IT[0-9][0-9][0-9][0-9][0-9]'
+    `);
+    const nextId = `IT${String(Number(maxRes.rows[0].n) + 1).padStart(5, "0")}`;
+
+    query(
+      `INSERT INTO items (item_id, item_name, price, is_active) VALUES (?, ?, ?, ?)`,
+      [nextId, item_name, price || 0, is_active || "Y"]
     );
 
-    res.status(201).json(result.rows[0]);
+    const inserted = query("SELECT * FROM items WHERE item_id = ?", [nextId]);
+    res.status(201).json(inserted.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Error creating item" });
@@ -166,9 +156,9 @@ app.post("/items", async (req, res) => {
 
 // ===================== INVOICES =====================
 
-app.get("/invoice/all", async (req, res) => {
+app.get("/invoice/all", (req, res) => {
   try {
-    const result = await db.query(`
+    const result = query(`
       SELECT i.invoice_id,
              i.cust_id,
              i.total_amount,
@@ -179,9 +169,8 @@ app.get("/invoice/all", async (req, res) => {
              i.gst_applied
       FROM invoices i
       LEFT JOIN customers c ON c.cust_id = i.cust_id
-      ORDER BY i.created_at DESC NULLS LAST, i.id DESC
+      ORDER BY i.created_at DESC, i.id DESC
     `);
-
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -189,7 +178,7 @@ app.get("/invoice/all", async (req, res) => {
   }
 });
 
-app.get("/invoice/:id", async (req, res) => {
+app.get("/invoice/:id", (req, res) => {
   try {
     const raw = decodeURIComponent(req.params.id);
     const asInt = parseInt(raw, 10);
@@ -202,24 +191,24 @@ app.get("/invoice/:id", async (req, res) => {
 
     let invoice;
     if (!Number.isNaN(asInt) && String(asInt) === String(raw).trim()) {
-      invoice = await db.query(`${baseSelect} WHERE i.id = $1`, [asInt]);
+      invoice = query(`${baseSelect} WHERE i.id = ?`, [asInt]);
     }
-    if (!invoice || invoice.rows.length === 0) {
-      invoice = await db.query(`${baseSelect} WHERE i.invoice_id = $1`, [raw]);
+    if (!invoice || invoice.rowCount === 0) {
+      invoice = query(`${baseSelect} WHERE i.invoice_id = ?`, [raw]);
     }
 
-    if (invoice.rows.length === 0) {
+    if (invoice.rowCount === 0) {
       return res.status(404).json({ error: "Invoice not found" });
     }
 
     const row = invoice.rows[0];
 
-    const items = await db.query(
+    const itemsRes = query(
       `
-      SELECT ii.item_id, ii.quantity, ii.price, i.item_name
+      SELECT ii.item_id, ii.quantity, ii.price, it.item_name
       FROM invoice_items ii
-      LEFT JOIN items i ON i.item_id = ii.item_id
-      WHERE ii.invoice_id = $1
+      LEFT JOIN items it ON it.item_id = ii.item_id
+      WHERE ii.invoice_id = ?
       ORDER BY ii.id
     `,
       [row.id]
@@ -227,8 +216,8 @@ app.get("/invoice/:id", async (req, res) => {
 
     res.json({
       ...row,
-      lines: items.rows,
-      items: items.rows,
+      lines: itemsRes.rows,
+      items: itemsRes.rows,
       final_amount: row.total_amount,
     });
   } catch (err) {
@@ -247,19 +236,23 @@ app.post("/invoice/create", async (req, res) => {
   }
 
   const custKey = String(cust_id).trim();
-  const client = await db.connect();
 
+  // Serialise invoice creation to avoid concurrent id collisions.
+  invoiceLock = invoiceLock.then(() => _createInvoice(custKey, items, res));
+  await invoiceLock;
+});
+
+function _createInvoice(custKey, items, res) {
+  const client = connect();
   try {
-    await client.query("BEGIN");
+    client.begin();
 
-    const customerRes = await client.query(
-      "SELECT cust_id, cust_gst, is_active FROM customers WHERE cust_id = $1",
+    const customerRes = client.query(
+      "SELECT cust_id, cust_gst, is_active FROM customers WHERE cust_id = ?",
       [custKey]
     );
     const customer = customerRes.rows[0];
-    if (!customer) {
-      throw new Error("Customer not found");
-    }
+    if (!customer) throw new Error("Customer not found");
 
     let subtotal = 0;
     const lineRows = [];
@@ -267,45 +260,42 @@ app.post("/invoice/create", async (req, res) => {
     for (const line of items) {
       const itemKey = String(line.item_id).trim();
       const qty = Math.max(1, parseInt(line.quantity, 10) || 0);
-      if (!itemKey || qty < 1) {
-        throw new Error("Each line needs item_id and quantity");
-      }
+      if (!itemKey || qty < 1) throw new Error("Each line needs item_id and quantity");
 
-      const itemRes = await client.query("SELECT price FROM items WHERE item_id = $1", [itemKey]);
-      if (itemRes.rows.length === 0) {
-        throw new Error(`Item not found: ${itemKey}`);
-      }
+      const itemRes = client.query("SELECT price FROM items WHERE item_id = ?", [itemKey]);
+      if (itemRes.rowCount === 0) throw new Error(`Item not found: ${itemKey}`);
+
       const unit = Number(itemRes.rows[0].price);
-      const lineTotal = unit * qty;
-      subtotal += lineTotal;
+      subtotal += unit * qty;
       lineRows.push({ item_id: itemKey, quantity: qty, price: unit });
     }
 
     const totals = computeInvoiceTotals(subtotal, customer);
     const totalRounded = parseFloat(totals.totalAmount.toFixed(2));
-    const subRounded = parseFloat(subtotal.toFixed(2));
-    const gstRounded = parseFloat(totals.gstAmount.toFixed(2));
+    const subRounded   = parseFloat(subtotal.toFixed(2));
+    const gstRounded   = parseFloat(totals.gstAmount.toFixed(2));
 
-    const invoiceId = await generateUniqueInvoiceId(client);
+    const invoiceId = generateUniqueInvoiceId(client);
 
-    const invoiceRes = await client.query(
+    // Insert invoice; get its auto-generated PK via last_insert_rowid()
+    client.query(
       `INSERT INTO invoices (invoice_id, cust_id, total_amount, gst_applied)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, invoice_id, total_amount, gst_applied`,
-      [invoiceId, custKey, totalRounded, totals.gstApplied]
+       VALUES (?, ?, ?, ?)`,
+      [invoiceId, custKey, totalRounded, totals.gstApplied ? 1 : 0]
     );
 
-    const dbInvoicePk = invoiceRes.rows[0].id;
+    // Fetch PK within the same transaction (before commit) 
+    const pkRes = client.query("SELECT last_insert_rowid() AS pk");
+    const dbInvoicePk = pkRes.rows[0].pk;
 
     for (const L of lineRows) {
-      await client.query(
-        `INSERT INTO invoice_items (invoice_id, item_id, quantity, price)
-         VALUES ($1, $2, $3, $4)`,
+      client.query(
+        `INSERT INTO invoice_items (invoice_id, item_id, quantity, price) VALUES (?, ?, ?, ?)`,
         [dbInvoicePk, L.item_id, L.quantity, L.price]
       );
     }
 
-    await client.query("COMMIT");
+    client.commit(); // also persists to database.db
 
     res.status(201).json({
       message: "Invoice created",
@@ -320,20 +310,27 @@ app.post("/invoice/create", async (req, res) => {
       gst_applied: totals.gstApplied,
     });
   } catch (err) {
-    await client.query("ROLLBACK");
+    client.rollback();
     console.error(err);
     res.status(500).json({ error: err.message || "Error creating invoice" });
   } finally {
     client.release();
   }
-});
+}
 
 // ===================== SERVER =====================
 
-ensureInvoiceGstColumn()
-  .catch((e) => console.warn("Could not ensure invoices.gst_applied:", e.message))
-  .finally(() => {
-    app.listen(5000, () => {
-      console.log("✅ Server running on port 5000");
+const PORT = process.env.PORT || 5000;
+
+// sql.js initialisation is async — open the DB, init schema, then listen.
+open()
+  .then(() => {
+    initDb(); // create tables + seed data (idempotent)
+    app.listen(PORT, () => {
+      console.log(`✅ Server running on port ${PORT}`);
     });
+  })
+  .catch((err) => {
+    console.error("Failed to open database:", err);
+    process.exit(1);
   });
