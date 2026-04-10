@@ -1,6 +1,5 @@
 const express = require("express");
 const cors = require("cors");
-const bodyParser = require("body-parser");
 const { open, query, connect } = require("./db");
 const initDb = require("./init_db");
 
@@ -27,7 +26,8 @@ app.use(
     credentials: true,
   })
 );
-app.use(bodyParser.json());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const GST_RATE = 0.18;
 
@@ -106,13 +106,54 @@ app.get("/customers", (req, res) => {
 
 app.post("/customers", (req, res) => {
   try {
-    const { cust_name, cust_address, cust_pan, cust_gst, is_active } = req.body;
+    console.log("[POST /customers] req.body:", req.body);
 
-    if (!cust_name) {
-      return res.status(400).json({ error: "Customer name required" });
+    const {
+      cust_name,
+      cust_address = "",
+      cust_pan = "",
+      cust_gst = "",
+      is_active,
+    } = req.body || {};
+
+    // ── Validation ────────────────────────────────────────────────────────
+    if (!cust_name || !String(cust_name).trim()) {
+      return res.status(400).json({ error: "cust_name is required" });
     }
 
-    // Auto-generate next id: C00001, C00002, …
+    const panStr = String(cust_pan || "").trim();
+    if (panStr !== "" && panStr.length !== 10) {
+      return res.status(400).json({
+        error: `cust_pan must be exactly 10 characters (got ${panStr.length})`
+      });
+    }
+
+    const gstStr = String(cust_gst || "").trim();
+    if (gstStr !== "" && gstStr.length !== 15) {
+      return res.status(400).json({
+        error: `cust_gst must be exactly 15 characters (got ${gstStr.length})`
+      });
+    }
+
+    // Normalise is_active → 'Y' or 'N' (accepts boolean true/false, 'Y'/'N',
+    // 'Active'/'Inactive', 1/0, etc.)
+    let activeFlag;
+    if (is_active === undefined || is_active === null || is_active === "") {
+      activeFlag = "Y"; // default
+    } else if (typeof is_active === "boolean") {
+      activeFlag = is_active ? "Y" : "N";
+    } else {
+      const u = String(is_active).trim().toUpperCase();
+      if (["Y", "YES", "TRUE", "1", "ACTIVE"].includes(u)) activeFlag = "Y";
+      else if (["N", "NO", "FALSE", "0", "INACTIVE"].includes(u)) activeFlag = "N";
+      else {
+        return res.status(400).json({
+          error: `is_active must be 'Y' or 'N' (received: ${is_active})`
+        });
+      }
+    }
+
+    // ── Auto-generate next cust_id: C00001, C00002, … ────────────────────
     const maxRes = query(`
       SELECT COALESCE(MAX(CAST(SUBSTR(cust_id, 2) AS INTEGER)), 0) AS n
       FROM customers
@@ -123,14 +164,15 @@ app.post("/customers", (req, res) => {
     query(
       `INSERT INTO customers (cust_id, cust_name, cust_address, cust_pan, cust_gst, is_active)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [nextId, cust_name, cust_address || "", cust_pan || "", cust_gst || "", is_active || "Y"]
+      [nextId, String(cust_name).trim(), String(cust_address), panStr, gstStr, activeFlag]
     );
 
     const inserted = query("SELECT * FROM customers WHERE cust_id = ?", [nextId]);
+    console.log("[POST /customers] Created:", inserted.rows[0]);
     res.status(201).json(inserted.rows[0]);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Error creating customer" });
+    console.error("[POST /customers] Error:", err);
+    res.status(500).json({ error: err.message || "Error creating customer" });
   }
 });
 
