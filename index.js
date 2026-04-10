@@ -5,7 +5,28 @@ const { open, query, connect } = require("./db");
 const initDb = require("./init_db");
 
 const app = express();
-app.use(cors());
+
+// Allow requests from the Vercel frontend (and localhost during development).
+// Set ALLOWED_ORIGIN env var on Render if your Vercel URL changes.
+const ALLOWED_ORIGINS = [
+  process.env.ALLOWED_ORIGIN,          // set on Render → your Vercel URL
+  'http://localhost:3000',              // CRA dev server
+  'http://localhost:5173',              // Vite dev server
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow requests with no origin (curl, Postman, server-to-server)
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      cb(new Error(`CORS: origin ${origin} not allowed`));
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+  })
+);
 app.use(bodyParser.json());
 
 const GST_RATE = 0.18;
