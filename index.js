@@ -176,6 +176,94 @@ app.post("/customers", (req, res) => {
   }
 });
 
+// ─── Toggle customer status (flip is_active) ────────────────────────
+app.patch("/customer/:id/toggle", (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({ error: "Customer ID is required" });
+    }
+
+    const current = query("SELECT * FROM customers WHERE cust_id = ?", [id]);
+    if (current.rowCount === 0) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+
+    const currentStatus = current.rows[0].is_active;
+    const newStatus = currentStatus === "Y" ? "N" : "Y";
+
+    query("UPDATE customers SET is_active = ? WHERE cust_id = ?", [newStatus, id]);
+
+    const updated = query("SELECT * FROM customers WHERE cust_id = ?", [id]);
+    console.log("[PATCH /customer/:id/toggle] Toggled:", updated.rows[0]);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    console.error("[PATCH /customer/:id/toggle] Error:", err);
+    res.status(500).json({ error: err.message || "Error toggling customer status" });
+  }
+});
+// ─── Toggle ALL customers ────────────────────────────────────────────────
+app.patch("/customers/toggle-all", (req, res) => {
+  try {
+    const { is_active } = req.body;
+    if (is_active === undefined) {
+      return res.status(400).json({ error: "is_active boolean is required" });
+    }
+    const activeFlag = is_active ? "Y" : "N";
+    query("UPDATE customers SET is_active = ?", [activeFlag]);
+    const updated = query("SELECT * FROM customers");
+    res.json({ message: "Successfully toggled all records", rows: updated.rows });
+  } catch (err) {
+    console.error("[PATCH /customers/toggle-all] Error:", err);
+    res.status(500).json({ error: "Error toggling all customers" });
+  }
+});
+
+
+// ─── Update customer status (toggle active/inactive) ────────────────────────
+app.put("/customers/:id", (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_active } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "Customer ID is required" });
+    }
+
+    // Normalize is_active to 'Y' or 'N'
+    let activeFlag;
+    if (is_active === undefined || is_active === null || is_active === "") {
+      return res.status(400).json({ error: "is_active is required" });
+    } else if (typeof is_active === "boolean") {
+      activeFlag = is_active ? "Y" : "N";
+    } else {
+      const u = String(is_active).trim().toUpperCase();
+      if (["Y", "YES", "TRUE", "1", "ACTIVE"].includes(u)) activeFlag = "Y";
+      else if (["N", "NO", "FALSE", "0", "INACTIVE"].includes(u)) activeFlag = "N";
+      else {
+        return res.status(400).json({
+          error: `is_active must be 'Y' or 'N' (received: ${is_active})`
+        });
+      }
+    }
+
+    // Update customer
+    query("UPDATE customers SET is_active = ? WHERE cust_id = ?", [activeFlag, id]);
+
+    const updated = query("SELECT * FROM customers WHERE cust_id = ?", [id]);
+    if (updated.rowCount === 0) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+
+    console.log("[PUT /customers/:id] Updated:", updated.rows[0]);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    console.error("[PUT /customers/:id] Error:", err);
+    res.status(500).json({ error: err.message || "Error updating customer" });
+  }
+});
+
 // ===================== ITEMS =====================
 
 app.get("/items", (req, res) => {
@@ -246,6 +334,94 @@ app.post("/items", (req, res) => {
   } catch (err) {
     console.error("[POST /items] Error:", err);
     res.status(500).json({ error: err.message || "Error creating item" });
+  }
+});
+
+// ─── Toggle ALL items ──────────────────────────────────────────────────
+app.patch("/items/toggle-all", (req, res) => {
+  try {
+    const { is_active } = req.body;
+    if (is_active === undefined) {
+      return res.status(400).json({ error: "is_active boolean is required" });
+    }
+    const activeFlag = is_active ? "Y" : "N";
+    query("UPDATE items SET is_active = ?", [activeFlag]);
+    const updated = query("SELECT * FROM items");
+    res.json({ message: "Successfully toggled all records", rows: updated.rows });
+  } catch (err) {
+    console.error("[PATCH /items/toggle-all] Error:", err);
+    res.status(500).json({ error: "Error toggling all items" });
+  }
+});
+
+// ─── Toggle item status (flip is_active) ───────────────────────────
+app.patch("/item/:id/toggle", (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({ error: "Item ID is required" });
+    }
+
+    const current = query("SELECT * FROM items WHERE item_id = ?", [id]);
+    if (current.rowCount === 0) {
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    const currentStatus = current.rows[0].is_active;
+    const newStatus = currentStatus === "Y" ? "N" : "Y";
+
+    query("UPDATE items SET is_active = ? WHERE item_id = ?", [newStatus, id]);
+
+    const updated = query("SELECT * FROM items WHERE item_id = ?", [id]);
+    console.log("[PATCH /item/:id/toggle] Toggled:", updated.rows[0]);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    console.error("[PATCH /item/:id/toggle] Error:", err);
+    res.status(500).json({ error: err.message || "Error toggling item status" });
+  }
+});
+
+// ─── Update item status (toggle active/inactive) ──────────────────────────
+app.put("/items/:id", (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_active } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: "Item ID is required" });
+    }
+
+    // Normalize is_active to 'Y' or 'N'
+    let activeFlag;
+    if (is_active === undefined || is_active === null || is_active === "") {
+      return res.status(400).json({ error: "is_active is required" });
+    } else if (typeof is_active === "boolean") {
+      activeFlag = is_active ? "Y" : "N";
+    } else {
+      const u = String(is_active).trim().toUpperCase();
+      if (["Y", "YES", "TRUE", "1", "ACTIVE"].includes(u)) activeFlag = "Y";
+      else if (["N", "NO", "FALSE", "0", "INACTIVE"].includes(u)) activeFlag = "N";
+      else {
+        return res.status(400).json({
+          error: `is_active must be 'Y' or 'N' (received: ${is_active})`
+        });
+      }
+    }
+
+    // Update item
+    query("UPDATE items SET is_active = ? WHERE item_id = ?", [activeFlag, id]);
+
+    const updated = query("SELECT * FROM items WHERE item_id = ?", [id]);
+    if (updated.rowCount === 0) {
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    console.log("[PUT /items/:id] Updated:", updated.rows[0]);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    console.error("[PUT /items/:id] Error:", err);
+    res.status(500).json({ error: err.message || "Error updating item" });
   }
 });
 
